@@ -1,7 +1,8 @@
 import numpy as np
 import cv2
-from sim_utils.classes import Car, Display, Driver, Drone
-import time
+from sim_utils.classes import Car, Display, Driver, Drone, ImageProcessor, DroneParametersReader
+import random
+import threading
 
 if __name__ == '__main__':
     field = cv2.imread('images/grass.jpg')
@@ -11,21 +12,29 @@ if __name__ == '__main__':
     car2_im = cv2.imread('images/car2s.png')
     car3_im = cv2.imread('images/car3s.png')
 
+    haar_cascade = cv2.CascadeClassifier('car_models/git_cars/2.xml')
+
     cars = [Car() for i in range(3)]
 
     drivers = [Driver(car, field_size) for car in cars]
-    cars[0].set_position((1000, 1000))
-
     display = Display(field, [car1_im, car2_im, car3_im], cars)
 
     hor_angle = 1.13
     screen_ratio = 0.6
     pitch = 0
     yaw = 0
-    altitude = 100
+    altitude = 100  # in decimeter
     cam_settings = hor_angle, screen_ratio
     drone = Drone(cam_settings, altitude, pitch, yaw)
+    print('init drone position to:', cars[0].get_position)
     drone.init_position(cars[0].get_position)
+
+    processor = ImageProcessor((hor_angle, screen_ratio), 1)
+
+    # this daemon is reading drone parameters (gps position, altitude, pitch, yaw) every second
+    drone_updater = DroneParametersReader(drone, processor)
+    drone_updater.setDaemon(True)
+    drone_updater.start()
 
     dt = 0.02
 
@@ -36,31 +45,24 @@ if __name__ == '__main__':
         display.update_field()
         drone_input = drone.display_visible(display.field_with_cars)
 
-        b, g, r, _ = cv2.mean(drone_input)
-
-        non_green = drone_input.copy().astype(float)
-        non_green[:, :, 0] -= b
-        non_green[:, :, 1] -= g
-        non_green[:, :, 2] -= r
-        non_green = np.abs(non_green).astype(np.uint8)
-
-        non_green = np.max(non_green, axis=2)
-        gray = np.dstack((non_green, non_green, non_green)).astype(np.uint8)
-
-        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
-
-        cv2.imshow('gray', gray)
-        corners = cv2.cornerHarris(gray, 2, 3, 0.04)
-
-        corners = cv2.dilate(corners, None)
-
-        drone_input[corners > 0.01 * corners.max()] = [0, 0, 255]
+        # show them on the screen
+        # drone_input[] = [0, 0, 255]
 
         display.show_field()
         cv2.imshow('corners', drone_input)
 
-        t = drone.transform_view(drone_input)
-        cv2.imshow('transfered', t)
+        flat_image = processor.transform_view(drone_input)
+
+        # cars = processor.find_cars_haar(flat_image, haar_cascade)
+        cars = processor.find_cars(flat_image)
+
+        if cars:
+            for (x, y, w, h) in cars:
+                cv2.rectangle(flat_image, (x, y), (x + w, y + h), (150, 150, 0), 2)
+        # else:
+        #     break
+        cv2.imshow('found', flat_image)
+        # cv2.imshow('transfered', processor.find_cars(flat_image))
 
         key = cv2.waitKey(int(dt * 1000))
         if key == ord('q'):

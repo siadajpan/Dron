@@ -4,6 +4,8 @@ import math
 from math import cos, sin
 import random
 import imutils
+import time
+import threading
 
 MAX_ANGLE_CHANGE = math.pi/30
 MAX_SPEED = 85                  # in dm / s (pixels / s)
@@ -74,6 +76,7 @@ class Driver:
         field_size_x, field_size_y = self.field_size
         pos_x = random.random() * field_size_x * 0.6 + 0.2 * field_size_x
         pos_y = random.random() * field_size_y * 0.6 + 0.2 * field_size_x
+        print('setting car position')
         self.car.set_position((pos_x, pos_y))
         self.car.set_direction(random.random() * 2 * math.pi)
         self.car.set_speed(random.random() * MAX_SPEED)
@@ -168,13 +171,13 @@ class Drone:
     def move(self, dir):
         curr_position = np.array(self.position)
         if dir == 'up':
-            curr_position[1] = self.position[1] - 10
-        elif dir == 'down':
-            curr_position[1] = self.position[1] + 10
-        elif dir == 'right':
-            curr_position[0] = self.position[0] + 10
-        elif dir == 'left':
             curr_position[0] = self.position[0] - 10
+        elif dir == 'down':
+            curr_position[0] = self.position[0] + 10
+        elif dir == 'right':
+            curr_position[1] = self.position[1] + 10
+        elif dir == 'left':
+            curr_position[1] = self.position[1] - 10
         self.position = tuple(curr_position)
 
     def rotate_pitch(self, dir):
@@ -212,8 +215,8 @@ class Drone:
         rot = cv2.getRotationMatrix2D((0, 0), self.yaw * 180 / math.pi, 1)
         points_rotated = np.dot(points, rot[:2, :2])
 
-        points_rotated[:, 0] += self.position[0]
-        points_rotated[:, 1] += self.position[1]
+        points_rotated[:, 0] += self.position[1]
+        points_rotated[:, 1] += self.position[0]
 
         out_width = 300
         out_height = int(out_width * self.screen_ratio)
@@ -225,9 +228,56 @@ class Drone:
 
         return visible
 
-    def transform_view(self, image, max_length=1000, pixel_density=1):
+
+class ImageProcessor:
+    def __init__(self, cam_settings, pixel_density):
+        self.hor_angle, self.screen_ratio = cam_settings
+        self.ver_angle = 2 * math.atan(self.screen_ratio * math.tan(self.hor_angle / 2))
+        self.altitude = 0
+        self.position = 0
+        self.pitch = 0
+        self.yaw = 0
+        self.pixel_density = pixel_density
+        self.blob_detector = self.init_blob_detector()
+
+    def init_blob_detector(self):
+        params = cv2.SimpleBlobDetector_Params()
+        params.minThreshold = 0
+        params.maxThreshold = 255
+
+        ################## CHANGE HERE
+        # change this to be dependent on pixel density
+        params.filterByArea = True
+        params.minArea = 400
+        params.maxArea = 1000
+
+        params.filterByCircularity = False
+        params.filterByInertia = False
+        params.filterByConvexity = False
+        params.filterByColor = False
+
+        return cv2.SimpleBlobDetector_create(params)
+
+    def update_altitude(self, altitude):
+        self.altitude = altitude
+
+    def update_position(self, position):
+        self.position = position
+
+    def update_pitch(self, pitch):
+        self.pitch = pitch
+
+    def update_yaw(self, yaw):
+        self.yaw = yaw
+
+    def update_drone_readings(self, position, altitude, pitch, yaw):
+        self.update_position(position)
+        self.update_altitude(altitude)
+        self.update_pitch(pitch)
+        self.update_yaw(yaw)
+
+    def transform_view(self, image, max_length=1000):
         # max_length is the objects farthest away from drone in 3d cartesian
-        # cam_settings = (angle_of_view, screen_ratio, pitch)
 
         if self.altitude > max_length:
             print('altitude too high')
@@ -259,10 +309,10 @@ class Drone:
         top_vert_dist = self.altitude * math.tan(top_angle)
 
         # end_hor_distance should always be bigger if pitch >= 0
-        out_width = int(top_right * 2 * pixel_density)
-        out_height = int((top_vert_dist - bottom_vert_dist) * pixel_density)
+        out_width = int(top_right * 2 * self.pixel_density)
+        out_height = int((top_vert_dist - bottom_vert_dist) * self.pixel_density)
 
-        bottom_start_pixel = out_width / 2 - bottom_right * pixel_density
+        bottom_start_pixel = out_width / 2 - bottom_right * self.pixel_density
         # print(bottom_start_pixel)
         out_points = np.float32([[0, 0], [out_width, 0], [bottom_start_pixel, out_height],
                                  [out_width - bottom_start_pixel, out_height]])
@@ -272,3 +322,121 @@ class Drone:
         out = cv2.warpPerspective(image, m, (out_width, out_height))
 
         return out
+
+    def convert_to_gray(self, image):
+
+        b, g, r, _ = cv2.mean(image)
+
+        # convert image to float and subtract mean color
+        non_green = image.copy().astype(float)
+        non_green[:, :, 0] -= b
+        non_green[:, :, 1] -= g
+        non_green[:, :, 2] -= r
+
+        # for each pixel find a channel that maximizes absolute difference from mean
+        non_green = np.abs(non_green).astype(np.uint8)
+        non_green = np.max(non_green, axis=2)
+
+        # make gray-scale from this image
+        gray = np.dstack((non_green, non_green, non_green)).astype(np.uint8)
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+
+        return gray
+
+    def find_cars(self, flat_image, corner_min=1e-5):
+        gray = self.convert_to_gray(flat_image)
+
+        # find the corners of the image.
+        corners = cv2.cornerHarris(gray, 2, 3, 0.04)
+        corners = cv2.dilate(corners, None)
+        mask = (corners > 0.01 * corners.max()).astype(np.uint8) * 255
+        mask = np.dstack((mask, mask, mask))
+
+        ################## CHANGE HERE
+        # change this to be dependent on pixel density
+        kernel = np.ones((30, 30))
+        mask = cv2.dilate(mask, kernel)
+        mask = cv2.erode(mask, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # Setup SimpleBlobDetector parameters.
+
+        keypoints = self.blob_detector.detect(mask)
+
+        contours = []
+        for k in keypoints:
+            contours.append([int(k.pt[0] - k.size/2), int(k.pt[1] - k.size/2), int(k.size), int(k.size)])
+
+        for c in contours:
+            cv2.rectangle(mask, (c[0], c[1]), (c[0] + c[2], c[1] + c[3]), (0, 200, 244), 2)
+
+        cv2.imshow('m', mask)
+
+        return contours
+
+        # mask = corners > 0.01 * corners.max()
+        # flat_image[mask] = [0, 255, 255]
+        # ch = mask.astype(np.uint8) * 255
+        #
+        # mask_out = np.dstack((ch, ch, ch))
+        # cv2.imshow('mask', mask_out)
+        # # cv2.waitKey(0)
+        # cv2.imwrite('/home/karol/PycharmProjects/droniada_2019/mask.png', mask_out)
+        # # return 0
+        # width = 30
+        # keypoints = self.find_rectangle(mask.astype(int), width, 10)
+        # if keypoints:
+        #     x, y = keypoints
+        #
+        #     return list([min(x), min(y), max(x) - min(x), max(y) - min(y)])
+
+        # for x0, y0 in zip(y, x):
+        #     cv2.rectangle(flat_image, (x0, y0), (x0 + width, y0 + width), (155, 155, 0), 2)
+        #
+        # flat_image[mask] = [0, 155, 155]
+        # return flat_image
+
+    def find_rectangle(self, bin_image, width, threshold):
+        gray_mask = (bin_image * 255).astype(np.uint8)
+        gray = np.dstack((gray_mask, gray_mask, gray_mask))
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+        cv2.imshow('g', gray)
+
+        h, w = bin_image.shape
+        corners = np.nonzero(bin_image)
+        xedges = list(range(0, w, width))
+        yedges = list(range(0, h, width))
+        hist, _, _ = np.histogram2d(corners[0], corners[1], bins=[yedges, xedges])
+        ch = hist.astype(np.uint8)
+        hist = np.dstack((ch, ch, ch))
+        hist = cv2.resize(hist, (hist.shape[1] * width, hist.shape[0] * width))
+        ret, max = cv2.threshold(hist, 20, 255, cv2.THRESH_BINARY)
+        # max = np.array(np.where(hist > threshold * hist.mean()), dtype=np.uint8)
+        print(max)
+        cv2.imshow('hist', max)
+        detector = cv2.SimpleBlobDetector_create()
+        keypoints = detector.detect(max)
+        print('yo', keypoints)
+
+        return keypoints
+
+    def find_cars_haar(self, flat_image, haar_classifier):
+        gray = self.convert_to_gray(flat_image)
+        # gray = cv2.cvtColor(flat_image, cv2.COLOR_RGB2GRAY)
+        cars = haar_classifier.detectMultiScale(gray, 1.3, 5)
+
+        return cars
+
+
+class DroneParametersReader(threading.Thread):
+    def __init__(self, drone, processor):
+        threading.Thread.__init__(self)
+        self.drone = drone
+        self.processor = processor
+
+    def run(self):
+        # this thread will end when the main thread ends
+        while True:
+            self.processor.update_drone_readings(self.drone.position, self.drone.altitude, self.drone.pitch,
+                                                 self.drone.yaw)
+            time.sleep(1)
